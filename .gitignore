@@ -67,8 +67,7 @@ weights/
 Thumbs.db
 
 # Local/personal files
-GITHUB_PUSH_INSTRUCTIONS.md
-CONTRIBUTING.md
+
 
 # Config files (private)
 cfg/
