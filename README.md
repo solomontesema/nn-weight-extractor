@@ -62,7 +62,12 @@ Output: `outputs/weights.bin` and `outputs/bias.bin` in the `outputs/` directory
 ./weights_extractor --cfg model.cfg --weights model.weights --int16
 ```
 
-Output: Float32 files plus INT16 quantized files (`weight_int16.bin`, `bias_int16.bin`) and Q value files in the `outputs/` directory.
+**With calibration-based quantization:**
+```bash
+./weights_extractor --cfg model.cfg --weights model.weights --int16 --calib /path/to/images
+```
+
+Output: Float32 files plus INT16 quantized files (`weight_int16.bin`, `bias_int16.bin`) and Q value files in the `outputs/` directory. When using `--calib`, IOFM Q values are derived from activation statistics for improved quantization accuracy.
 
 ### Convert from Keras H5
 
@@ -124,6 +129,7 @@ python h5_to_darknet.py \
 - `--output-weights`: Output weights binary (default: outputs/weights.bin)
 - `--output-bias`: Output bias binary (default: outputs/bias.bin)
 - `--int16`: Enable INT16 quantization (outputs INT16 files and Q values)
+- `--calib <folder>`: Enable calibration-based quantization using images from specified folder (generates activation-based IOFM Q values)
 - `--output-weights-int16`: Output INT16 weights file (default: outputs/weight_int16.bin)
 - `--output-bias-int16`: Output INT16 bias file (default: outputs/bias_int16.bin)
 - `--output-weights-int16-q`: Output Q values for weights (default: outputs/weight_int16_Q.bin)
@@ -146,6 +152,7 @@ This tool extracts neural network weights and biases, then:
    - Per-layer Q value selection (Q0-Q15) for optimal precision
    - Converts float32 weights and biases to int16_t format
    - Generates Q value files for dequantization during inference
+   - Supports calibration-based quantization (with `--calib` flag) for activation-based IOFM Q values
    - Achieves 50% memory reduction while preserving accuracy
 5. **Generates configuration** describing network architecture
 
@@ -200,6 +207,16 @@ INT16 quantization converts float32 weights and biases to 16-bit integers using 
 - **Dequantization**: `float_value = (float)int16_value * 2^(-Q)`
 - **Per-layer Q selection**: Automatically finds the highest Q value that can represent all values in a layer
 
+### Calibration-Based Quantization
+
+For optimal quantization accuracy, the tool supports calibration-based quantization using representative input images. This generates activation-based Q values for input/output feature maps (IOFM) by analyzing actual activation ranges during forward passes:
+
+- **Activation-based Q values**: Q values are derived from actual activation statistics rather than weight statistics, providing better quantization accuracy
+- **Calibration images**: Provide a folder containing representative images (`.jpg` format) from your dataset
+- **Image selection**: If more than 10 images are provided, the tool uses the first 10 alphabetically ordered `.jpg` images for calibration
+- **Input layer Q value**: The first input layer always uses a constant Q value of 14 (Q14)
+- **Forward pass analysis**: The tool performs forward passes through the network to collect activation min/max statistics for each layer
+
 **Q-format ranges:**
 - Q0: [-32768, 32767] (largest range, lowest precision)
 - Q15: [-1, 0.99996948] (smallest range, highest precision)
@@ -223,8 +240,22 @@ This generates five output files in the `outputs/` directory:
 - `outputs/bias_int16_Q.bin`: Q values for each layer's biases (int32_t array)
 - `outputs/iofm_Q.bin`: Q values for input/output feature maps (int32_t array)
 
+**With calibration-based quantization:**
+
+```bash
+cd cpp
+./weights_extractor \
+    --cfg model.cfg \
+    --weights model.weights \
+    --int16 \
+    --calib /path/to/calibration/images
+```
+
+When using `--calib`, the tool performs forward passes on calibration images to generate activation-based IOFM Q values. This provides more accurate quantization compared to weight-based Q values, especially for complex network architectures.
+
 ### Example: YOLOv2 INT16 Quantization
 
+**Weight-based quantization:**
 ```bash
 cd cpp
 ./weights_extractor \
@@ -234,11 +265,24 @@ cd cpp
     --verbose
 ```
 
+**Calibration-based quantization:**
+```bash
+cd cpp
+./weights_extractor \
+    --cfg ../cfg/yolov2.cfg \
+    --weights ../weights/yolov2.weights \
+    --int16 \
+    --calib ../test_images \
+    --verbose
+```
+
 **Output:**
 - `outputs/weights.bin` and `outputs/bias.bin` (float32, always generated)
 - `outputs/weight_int16.bin` and `outputs/bias_int16.bin` (INT16 quantized)
 - `outputs/weight_int16_Q.bin` and `outputs/bias_int16_Q.bin` (Q values per layer)
 - `outputs/iofm_Q.bin` (Q values for input/output feature maps)
+  - With `--calib`: Activation-based Q values derived from forward pass statistics
+  - Without `--calib`: Weight-based Q values (fallback method)
 
 ### Custom Output Directory
 
@@ -277,9 +321,11 @@ read_file
 - `weight_int16_Q.bin`: One Q value per convolutional layer (0-15) for weights
 - `bias_int16_Q.bin`: One Q value per convolutional layer (0-15) for biases
 - `iofm_Q.bin`: Q values for input/output feature maps
-  - First value: Q14 (input Q for first layer)
-  - Subsequent values: Output Q for each layer (becomes input Q for next layer)
-  - Total: `num_layers + 1` values
+  - First value: Constant Q14 (input Q for the first layer, always 14)
+  - Subsequent values: Output Q for each convolutional layer (becomes input Q for next layer)
+  - Total: `num_conv_layers + 1` values
+  - When using `--calib`: Q values are derived from activation statistics during forward passes
+  - Without `--calib`: Q values are derived from weight statistics (fallback method)
 
 ### Benefits
 
@@ -289,6 +335,7 @@ read_file
 - **Maintains accuracy**: Per-layer Q selection preserves precision where possible
 - **Model-agnostic**: Works with any Darknet cfg file
 - **IOFM quantization**: Generates Q values for input/output feature maps for inference
+- **Calibration support**: Activation-based quantization using representative images for improved accuracy
 
 ### Dequantization Example
 
