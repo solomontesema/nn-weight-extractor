@@ -19,6 +19,9 @@
 #include "weights_reader.h"
 #include "batch_norm_folder.h"
 #include "int16_quantizer.h"
+#include "activation_tracker.h"
+#include <dirent.h>
+#include <algorithm>
 
 using namespace darknet;
 
@@ -35,6 +38,7 @@ struct Arguments {
     std::string output_weights_int16_q = "outputs/weight_int16_Q.bin";
     std::string output_bias_int16_q = "outputs/bias_int16_Q.bin";
     std::string output_iofm_q = "outputs/iofm_Q.bin";
+    std::string calibration_folder;  // Folder containing calibration images
     bool verbose = false;
     bool help = false;
 };
@@ -55,7 +59,8 @@ void print_usage(const char* program_name) {
     std::cout << "  --output-weights-int16-q PATH Output INT16 Q values file (default: outputs/weight_int16_Q.bin)\n";
     std::cout << "  --output-bias-int16-q PATH    Output INT16 Q values file (default: outputs/bias_int16_Q.bin)\n";
     std::cout << "  --output-iofm-q PATH          Output IOFM Q values file (default: outputs/iofm_Q.bin)\n";
-    std::cout << "  --verbose, -v           Enable verbose output\n";
+    std::cout << "  --calib FOLDER                Folder containing calibration images (max 10 images used)\n";
+    std::cout << "  --verbose, -v                 Enable verbose output\n";
     std::cout << "  --help, -h              Show this help message\n\n";
     std::cout << "Examples:\n";
     std::cout << "  " << program_name << " --cfg yolov2.cfg --weights yolov2.weights\n";
@@ -115,6 +120,8 @@ Arguments parse_arguments(int argc, char** argv) {
             args.output_bias_int16_q = argv[++i];
         } else if (arg == "--output-iofm-q" && i + 1 < argc) {
             args.output_iofm_q = argv[++i];
+        } else if (arg == "--calib" && i + 1 < argc) {
+            args.calibration_folder = argv[++i];
         } else {
             std::cerr << "Unknown argument: " << arg << std::endl;
         }
@@ -186,6 +193,52 @@ bool create_output_directory(const std::string& file_path) {
     return true;
 }
 
+/**
+ * Get image files from a directory (max 10 for calibration)
+ */
+std::vector<std::string> get_calibration_images(const std::string& folder_path, int max_images = 10) {
+    std::vector<std::string> image_files;
+    
+    DIR* dir = opendir(folder_path.c_str());
+    if (!dir) {
+        std::cerr << "Error: Cannot open calibration folder: " << folder_path << std::endl;
+        return image_files;
+    }
+    
+    struct dirent* entry;
+    std::vector<std::string> all_images;
+    
+    // Collect all image files
+    while ((entry = readdir(dir)) != nullptr) {
+        std::string filename = entry->d_name;
+        if (filename == "." || filename == "..") {
+            continue;
+        }
+        
+        // Check for common image extensions
+        std::string lower_filename = filename;
+        std::transform(lower_filename.begin(), lower_filename.end(), lower_filename.begin(), ::tolower);
+        
+        if (lower_filename.size() >= 4) {
+            std::string ext = lower_filename.substr(lower_filename.size() - 4);
+            if (ext == ".jpg" || ext == ".png" || ext == ".bmp" || 
+                (lower_filename.size() >= 5 && lower_filename.substr(lower_filename.size() - 5) == ".jpeg")) {
+                all_images.push_back(folder_path + "/" + filename);
+            }
+        }
+    }
+    closedir(dir);
+    
+    // Sort for consistent selection
+    std::sort(all_images.begin(), all_images.end());
+    
+    // Limit to max_images
+    int count = std::min(static_cast<int>(all_images.size()), max_images);
+    image_files.assign(all_images.begin(), all_images.begin() + count);
+    
+    return image_files;
+}
+
 int main(int argc, char** argv) {
     // Parse command-line arguments
     Arguments args = parse_arguments(argc, argv);
@@ -229,7 +282,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     
-    // Read header
+    // Read header (will be read again after activation computation if needed)
     weights_reader.read_header();
     
     // Create output directory if needed
@@ -290,9 +343,69 @@ int main(int argc, char** argv) {
     std::vector<int32_t> bias_q_values;
     std::vector<int32_t> iofm_q_values;  // Input/Output Feature Map Q values
     
-    // First layer input Q value is 14 (Q14) by default
-    if (args.int16_quantize) {
-        iofm_q_values.push_back(14);
+    // Compute activation-based IOFM Q values if calibration folder is provided
+    // This must be done BEFORE processing layers so we have the Q values ready
+    bool use_activation_q = false;
+    if (args.int16_quantize && !args.calibration_folder.empty()) {
+        if (args.verbose) {
+            std::cout << "\nScanning calibration folder: " << args.calibration_folder << std::endl;
+        }
+        
+        // Get calibration images from folder (max 10)
+        std::vector<std::string> calibration_images = get_calibration_images(args.calibration_folder, 10);
+        
+        if (calibration_images.empty()) {
+            std::cerr << "Error: No image files found in calibration folder: " 
+                      << args.calibration_folder << std::endl;
+            std::cerr << "Supported formats: .jpg, .jpeg, .png, .bmp" << std::endl;
+            return 1;
+        }
+        
+        if (args.verbose) {
+            std::cout << "Found " << calibration_images.size() << " calibration image(s)" << std::endl;
+            std::cout << "Computing activation-based IOFM Q values..." << std::endl;
+        }
+        
+        // Create a temporary weights reader for forward pass
+        WeightsReader temp_weights_reader(args.verbose);
+        if (!temp_weights_reader.open(args.weights_path)) {
+            std::cerr << "Error: Failed to open weights file for activation computation" << std::endl;
+            return 1;
+        }
+        temp_weights_reader.read_header();
+        temp_weights_reader.close();
+        
+        ActivationTracker activation_tracker(cfg_parser, args.verbose);
+        iofm_q_values = activation_tracker.compute_activation_q_values(
+            calibration_images,
+            args.weights_path,
+            bn_folder,
+            *quantizer
+        );
+        
+        if (iofm_q_values.empty()) {
+            std::cerr << "\nWarning: Failed to compute activation Q values from forward pass." << std::endl;
+            std::cerr << "This may be due to dimension tracking issues in complex network architectures." << std::endl;
+            std::cerr << "Falling back to weight-based Q values for IOFM (may be less accurate)." << std::endl;
+            std::cerr << "The tool will continue with weight extraction and quantization." << std::endl;
+            use_activation_q = false;
+            iofm_q_values.clear();
+            iofm_q_values.push_back(14);  // First layer input Q14
+        } else {
+            use_activation_q = true;
+        }
+        
+        if (args.verbose) {
+            std::cout << "Computed " << iofm_q_values.size() << " activation-based IOFM Q values" << std::endl;
+        }
+    } else if (args.int16_quantize) {
+        // Fallback: use weight Q values if no calibration folder
+        if (args.verbose) {
+            std::cout << "\nWarning: No calibration folder provided. " 
+                      << "IOFM Q values will use weight Q values (may be inaccurate)." << std::endl;
+            std::cout << "For accurate results, use --calib <folder_path>" << std::endl;
+        }
+        iofm_q_values.push_back(14);  // First layer input Q14
     }
     
     // Process each convolutional layer
@@ -390,9 +503,17 @@ int main(int argc, char** argv) {
             weight_q_values.push_back(quantized.q_value);
             bias_q_values.push_back(quantized.q_value);
             
-            // Store output feature map Q value (same as weight Q for this layer)
-            // This becomes the input Q for the next layer
-            iofm_q_values.push_back(quantized.q_value);
+            // IOFM Q values: use activation-based if computed, otherwise fallback to weight Q
+            if (!use_activation_q) {
+                // Fallback: use weight Q for IOFM (less accurate)
+                if (iofm_q_values.size() == 1) {
+                    // First value is already Q14, now add output Q for this layer
+                    iofm_q_values.push_back(quantized.q_value);
+                } else {
+                    iofm_q_values.push_back(quantized.q_value);
+                }
+            }
+            // If use_activation_q is true, iofm_q_values already contains activation-based Q values
         }
         
         total_weights += folded.weights.size();

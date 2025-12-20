@@ -111,6 +111,16 @@ public:
      * Print configuration summary
      */
     void print_summary() const;
+    
+    /**
+     * Get network configuration (alias for get_network_config)
+     */
+    const NetworkConfig& get_net_config() const { return net_config_; }
+    
+    /**
+     * Resolve layer index from reference (for route/shortcut layers)
+     */
+    int resolve_layer_index(int current_index, int reference) const;
 
 private:
     bool verbose_;
@@ -118,7 +128,6 @@ private:
     std::vector<LayerConfig> layers_;
     
     void compute_layer_channels();
-    int resolve_layer_index(int current_index, int reference) const;
     
     // Helper methods
     void parse_net_section(const std::map<std::string, std::string>& options);

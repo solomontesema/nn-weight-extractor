@@ -12,7 +12,8 @@ SOURCES = src/main.cpp \
           src/cfg_parser.cpp \
           src/weights_reader.cpp \
           src/batch_norm_folder.cpp \
-          src/int16_quantizer.cpp
+          src/int16_quantizer.cpp \
+          src/activation_tracker.cpp
 
 # Object files
 OBJECTS = $(SOURCES:.cpp=.o)
